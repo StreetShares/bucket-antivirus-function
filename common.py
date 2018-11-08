@@ -33,6 +33,8 @@ AV_PROCESS_ORIGINAL_VERSION_ONLY = os.getenv("AV_PROCESS_ORIGINAL_VERSION_ONLY",
 
 AV_DEFINITION_FILENAMES = ["main.cvd","daily.cvd", "daily.cud", "bytecode.cvd", "bytecode.cud"]
 
+ENCRYPTION_STATUS_METADATA = os.getenv("ENCRYPTION_STATUS_METADATA", "encryption-status")
+
 s3 = boto3.resource('s3')
 s3_client = boto3.client('s3')
 
@@ -40,7 +42,6 @@ s3_client = boto3.client('s3')
 def create_dir(path):
     if not os.path.exists(path):
         try:
-            print("Starting bucket-antivirus-function v0.8")
             print("Attempting to create directory %s.\n" % path)
             os.makedirs(path)
         except OSError as exc:

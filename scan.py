@@ -18,6 +18,10 @@ import copy
 import json
 import metrics
 import urllib
+import traceback
+from crypt import Encryptor
+from crypt import NullEncryptor
+
 from common import *
 from datetime import datetime
 from distutils.util import strtobool
@@ -60,10 +64,37 @@ def download_s3_object(s3_object, local_prefix):
     return local_path
 
 
-def set_av_metadata(s3_object, result):
+def decrypt_s3_object(encrypted_file):
+    decrypt_result = "ENCRYPTED"
+    decrypted_file = None
+    decrypted_contents = None
+    epw = os.getenv('ENCRYPT_PASSWORD')
+
+    cry = Encryptor(epw) if epw else NullEncryptor()
+
+    with open(encrypted_file) as ef:
+        encrypted_contents = ef.read()
+
+    try:
+        decrypted_contents = cry.decrypt(encrypted_contents)
+    except Exception as e:
+        decrypt_result = "UNDECRYPTABLE"
+        print("UNDECRYPTABLE file: {0}".format(encrypted_file))
+        traceback.print_exc()
+
+    if decrypted_contents:
+        decrypted_file = "{0}{1}".format(encrypted_file, ".decrypted")
+        with open(decrypted_file, 'w') as df:
+            df.write(decrypted_contents)
+
+    return decrypt_result, decrypted_file
+
+
+def set_av_metadata(s3_object, decrypt_result, scan_result):
     content_type = s3_object.content_type
     metadata = s3_object.metadata
-    metadata[AV_STATUS_METADATA] = result
+    metadata[ENCRYPTION_STATUS_METADATA] = decrypt_result
+    metadata[AV_STATUS_METADATA] = scan_result
     metadata[AV_TIMESTAMP_METADATA] = datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S UTC")
     s3_object.copy(
         {
@@ -78,13 +109,14 @@ def set_av_metadata(s3_object, result):
     )
 
 
-def set_av_tags(s3_object, result):
+def set_av_tags(s3_object, decrypt_result, scan_result):
     curr_tags = s3_client.get_object_tagging(Bucket=s3_object.bucket_name, Key=s3_object.key)["TagSet"]
     new_tags = copy.copy(curr_tags)
     for tag in curr_tags:
         if tag["Key"] in [AV_STATUS_METADATA, AV_TIMESTAMP_METADATA]:
             new_tags.remove(tag)
-    new_tags.append({"Key": AV_STATUS_METADATA, "Value": result})
+    new_tags.append({"Key": ENCRYPTION_STATUS_METADATA, "Value": decrypt_result})
+    new_tags.append({"Key": AV_STATUS_METADATA, "Value": scan_result})
     new_tags.append({"Key": AV_TIMESTAMP_METADATA, "Value": datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S UTC")})
     s3_client.put_object_tagging(
         Bucket=s3_object.bucket_name,
@@ -109,14 +141,15 @@ def sns_start_scan(s3_object):
         MessageStructure="json"
     )
 
-def sns_scan_results(s3_object, result):
+def sns_scan_results(s3_object, decrypt_result, scan_result):
     if AV_STATUS_SNS_ARN is None:
         return
     message = {
         "bucket": s3_object.bucket_name,
         "key": s3_object.key,
         "version": s3_object.version_id,
-        AV_STATUS_METADATA: result,
+        ENCRYPTION_STATUS_METADATA: decrypt_result,
+        AV_STATUS_METADATA: scan_result,
         AV_TIMESTAMP_METADATA: datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S UTC")
     }
     sns_client = boto3.client("sns")
@@ -134,15 +167,27 @@ def lambda_handler(event, context):
     s3_object = event_object(event)
     verify_s3_object_version(s3_object)
     sns_start_scan(s3_object)
+
     file_path = download_s3_object(s3_object, "/tmp")
+
+    decrypt_result, decrypted_file_path = decrypt_s3_object(file_path)
+
     clamav.update_defs_from_s3(AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX)
-    scan_result = clamav.scan_file(file_path)
+
+    if decrypt_result and decrypted_file_path:
+        scan_result = clamav.scan_file(decrypted_file_path)
+    else:
+        scan_result = clamav.scan_file(file_path)
+
     print("Scan of s3://%s resulted in %s\n" % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result))
     if "AV_UPDATE_METADATA" in os.environ:
-        set_av_metadata(s3_object, scan_result)
-    set_av_tags(s3_object, scan_result)
-    sns_scan_results(s3_object, scan_result)
+        set_av_metadata(s3_object, decrypt_result, scan_result)
+
+    set_av_tags(s3_object, decrypt_result, scan_result)
+    sns_scan_results(s3_object, decrypt_result, scan_result)
+
     metrics.send(env=ENV, bucket=s3_object.bucket_name, key=s3_object.key, status=scan_result)
+
     # Delete downloaded file to free up room on re-usable lambda function container
     try:
         os.remove(file_path)
